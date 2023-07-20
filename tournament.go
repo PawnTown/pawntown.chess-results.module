@@ -3,17 +3,22 @@ package pawntown_chess_results_module
 import (
 	"errors"
 	"fmt"
+	"html"
+	"net/url"
 	"regexp"
 	"strconv"
 )
 
 type Tournament struct {
-	api  *Api
-	id   string
-	data TournamentData
+	api          *Api
+	id           string
+	data         TournamentData
+	secInputData url.Values
 }
 
 type TournamentData struct {
+	RawMeta map[string]string
+
 	Name               string
 	Organizer          string
 	Federation         string
@@ -22,10 +27,10 @@ type TournamentData struct {
 	DeputyChiefArbiter string
 	TimeControl        string
 	Location           string
-	NumberOfRounds     int
+	NumberOfRounds     string
 	TournamentMode     string
 	EloCalculation     string
-	AverageElo         int
+	AverageElo         string
 	FromTo             string
 	Rounds             []Round
 	Players            []Player
@@ -85,43 +90,79 @@ func newTournament(api *Api, id string) (*Tournament, error) {
 	return tournament, nil
 }
 
+func (t *Tournament) UpdateSecurityData() error {
+	rawData, err := t.api.get(fmt.Sprintf("/%s.aspx", t.id))
+	if err != nil {
+		return err
+	}
+
+	secValues := url.Values{}
+	secValues.Set("cb_alleDetails", "Turnierdetails anzeigen")
+	secValues.Set("txt_name", "")
+
+	reSecData := regexp.MustCompile(`<input type="hidden".*?name="([^"]*?)".*?value="([^"]*?)"`)
+	inputsData := reSecData.FindAllStringSubmatch(rawData, -1)
+	for _, match := range inputsData {
+		secValues.Set(match[1], match[2])
+	}
+	t.secInputData = secValues
+	return nil
+}
+
 func (t *Tournament) Refresh() error {
 	t.data = TournamentData{}
 
-	rawData, err := t.api.get(fmt.Sprintf("https://chess-results.com/%s.aspx?turdet=YES", t.id))
+	if err := t.UpdateSecurityData(); err != nil {
+		return err
+	}
+
+	rawData, err := t.api.post(fmt.Sprintf("/%s.aspx?turdet=YES", t.id), t.secInputData)
 	if err != nil {
 		return err
 	}
 
 	// Tournament Information
 	reName := regexp.MustCompile(`<h2>(.*?)</h2>`)
-	reOrganizer := regexp.MustCompile(`<tr><td[^>]*>Veranstalter</td><td[^>]*>(.*?)</td></tr>`)
-	reFederation := regexp.MustCompile(`<tr><td[^>]*>F&ouml;deration</td><td[^>]*>(.*?)</td></tr>`)
-	reDirector := regexp.MustCompile(`<tr><td[^>]*>Turnierdirektor</td><td[^>]*>(.*?)</td></tr>`)
-	reChiefArbiter := regexp.MustCompile(`<tr[^>]*><td[^>]*>Hauptschiedsrichter</td><td[^>]*>(.*?)</td></tr>`)
-	reDeputyChiefArbiter := regexp.MustCompile(`<tr[^>]*><td[^>]*>Deputy Hauptschiedsrichter</td><td[^>]*>(.*?)</td></tr>`)
-	reTimeControl := regexp.MustCompile(`<tr><td[^>]*>Bedenkzeit \(Standard\)</td><td[^>]*>(.*?)</td></tr>`)
-	reLocation := regexp.MustCompile(`<tr><td[^>]*>Ort</td><td[^>]*>(.*?)</td></tr>`)
-	reNumberOfRounds := regexp.MustCompile(`<tr><td[^>]*>Rundenanzahl</td><td[^>]*>(.*?)</td></tr>`)
-	reTournamentMode := regexp.MustCompile(`<tr><td[^>]*>Turniermodus</td><td[^>]*>(.*?)</td></tr>`)
-	reEloCalculation := regexp.MustCompile(`<tr><td[^>]*>Elorechnung</td><td[^>]*>(.*?)</td></tr>`)
-	reAverageElo := regexp.MustCompile(`<tr><td[^>]*>Eloschnitt</td><td[^>]*>(.*?)</td></tr>`)
-	reFromTo := regexp.MustCompile(`<tr><td[^>]*>Von</td><td[^>]*>(.*?)</td></tr>`)
+	reMetaReader := regexp.MustCompile(`<tr[^>]*?><td[^>]*>([^>]*?)</td><td[^>]*>(.*?)</td></tr>`)
 
-	// Match and assign the values
 	t.data.Name = reName.FindStringSubmatch(rawData)[1]
-	t.data.Organizer = reOrganizer.FindStringSubmatch(rawData)[1]
-	t.data.Federation = reFederation.FindStringSubmatch(rawData)[1]
-	t.data.Director = reDirector.FindStringSubmatch(rawData)[1]
-	t.data.ChiefArbiter = reChiefArbiter.FindStringSubmatch(rawData)[1]
-	t.data.DeputyChiefArbiter = reDeputyChiefArbiter.FindStringSubmatch(rawData)[1]
-	t.data.TimeControl = reTimeControl.FindStringSubmatch(rawData)[1]
-	t.data.Location = reLocation.FindStringSubmatch(rawData)[1]
-	t.data.NumberOfRounds, _ = strconv.Atoi(reNumberOfRounds.FindStringSubmatch(rawData)[1])
-	t.data.TournamentMode = reTournamentMode.FindStringSubmatch(rawData)[1]
-	t.data.EloCalculation = reEloCalculation.FindStringSubmatch(rawData)[1]
-	t.data.AverageElo, _ = strconv.Atoi(reAverageElo.FindStringSubmatch(rawData)[1])
-	t.data.FromTo = reFromTo.FindStringSubmatch(rawData)[1]
+	t.data.RawMeta = map[string]string{}
+
+	metaEntries := reMetaReader.FindAllStringSubmatch(rawData, -1)
+	for _, match := range metaEntries {
+		key := match[1]
+		value := html.UnescapeString(match[2])
+		if key != "" {
+			t.data.RawMeta[key] = value
+
+			switch key {
+			case "Organizer(s)":
+				t.data.Organizer = value
+			case "Federation":
+				t.data.Federation = value
+			case "Tournament director":
+				t.data.Director = value
+			case "Chief Arbiter":
+				t.data.ChiefArbiter = value
+			case "Deputy Chief Arbiter":
+				t.data.DeputyChiefArbiter = value
+			case "Time control (Standard)":
+				t.data.TimeControl = value
+			case "Location":
+				t.data.Location = value
+			case "Number of rounds":
+				t.data.NumberOfRounds = value
+			case "Tournament type":
+				t.data.TournamentMode = value
+			case "Rating calculation":
+				t.data.EloCalculation = value
+			case "Rating-Ø":
+				t.data.AverageElo = value
+			case "Date":
+				t.data.FromTo = value
+			}
+		}
+	}
 
 	// Player Information
 	rePlayerRows := regexp.MustCompile(`\<tr[^>]*\>(.*)\<\/tr\>`)
